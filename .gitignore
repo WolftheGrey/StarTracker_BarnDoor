@@ -1,0 +1,33 @@
+# Arduino
+*.hex
+*.elf
+*.bin
+build/
+*.o
+*.d
+*.eep
+*.lss
+*.sym
+*.su
+*.cpp.dep
+*.ino.dep
+*.elf.dep
+*.hex.dep
+*.bin.dep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+

@@ -1,33 +1,45 @@
-# Arduino
+# Arduino/ESP32
 *.hex
 *.elf
 *.bin
-build/
-*.o
-*.d
 *.eep
 *.lss
 *.sym
 *.su
-*.cpp.dep
-*.ino.dep
-*.elf.dep
-*.hex.dep
-*.bin.dep
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Temporary files
+*.d
+*.o
+*.a
+*.ar
+*.so
+*.dylib
+*.app
+*.ihex
+*.srec
+*.lst
+*.map
 *.tmp
 *.bak
-*.log
+*.swp
+*~
 
+# Build directories
+build/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Arduino IDE
+*.prefs
+*.preferences
+
+# ESP32 specific
+.pio/
+.vscode/
+
+# Backup files
+*.ino.bak
+*_backup.*

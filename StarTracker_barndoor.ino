@@ -15,7 +15,8 @@
 #define PIN_STEP           33      // Пин STEP драйвера
 #define PIN_DIR            23      // Пин DIR драйвера
 #define PIN_MICROSTEP_EN   22      // Пин для включения микрошага (все джамперы MS1, MS2, MS3)
-#define PIN_ENDSTOP        25      // Пин концевого датчика (HIGH когда достигнуто стартовое положение)
+#define PIN_ENDSTOP        25      // Пин концевого датчика
+#define ENDSTOP_INVERT      true    // true = инвертировать логику (LOW = припаркованы), false = HIGH = припаркованы
 
 // Параметры механики
 #define ARM_LENGTH_MM      200.0   // Длина плеча в мм
@@ -45,7 +46,10 @@
 #define LED_BLINK_INTERVAL_MS  500   // Интервал мигания светодиода в мс
 
 // Параметры парковки (скорость)
-#define PARKING_SPEED_DEG_PER_SEC    10.0   // Максимальная скорость парковки в градусах/сек (без микрошага)
+// Ограничение: 28BYJ-48 может максимум ~1000-1500 шагов/сек без микрошага
+// При наших параметрах это примерно 0.15-0.22°/сек
+#define PARKING_SPEED_DEG_PER_SEC    0.2    // Скорость парковки в градусах/сек (без микрошага, ограничена возможностями мотора)
+#define MAX_PARKING_STEPS_PER_SEC    500   // Максимальная скорость шагов для парковки (шагов/сек)
 
 // Инверсия направления движения
 #define INVERT_DIRECTION            false   // true = инвертировать направление (поменять местами вперед/назад)
@@ -92,6 +96,7 @@ bool lastEndstopState = false;              // Предыдущее состоя
 hw_timer_t * stepTimer = NULL;
 volatile bool stepTimerFlag = false;        // Флаг для выполнения шага
 volatile unsigned long stepIntervalUs = 0;  // Интервал между шагами в микросекундах
+#define TIMER_FREQUENCY_HZ  1000000         // Частота таймера 1MHz (1 микросекунда на тик)
 
 // Preferences для сохранения угла
 Preferences preferences;
@@ -151,14 +156,37 @@ unsigned long calculateStepIntervalWithCompensation(double angleDeg, bool useMic
 
 /**
  * Расчет интервала между шагами для парковки (без компенсации, максимальная скорость)
+ * Используется полный шаг (без микрошага) для максимальной скорости
+ * Ограничено возможностями мотора 28BYJ-48 (~1000 шагов/сек максимум)
  */
 unsigned long calculateParkingStepInterval() {
-  double screwSpeedMmPerSec = ARM_LENGTH_MM * (PARKING_SPEED_DEG_PER_SEC * PI / 180.0);
+  // Угловая скорость в градусах/сек -> скорость шпильки в мм/сек
+  // Для малых углов: dθ/dt ≈ (1/L) * ds/dt, поэтому ds/dt = L * dθ/dt
+  double angleSpeedRadPerSec = PARKING_SPEED_DEG_PER_SEC * PI / 180.0;
+  double screwSpeedMmPerSec = ARM_LENGTH_MM * angleSpeedRadPerSec;
+  
+  // Скорость шпильки -> обороты шпильки/сек
   double screwRevolutionsPerSec = screwSpeedMmPerSec / SCREW_PITCH_MM;
+  
+  // Обороты -> шаги/сек (используем полный шаг, без микрошага)
   double stepsPerSec = screwRevolutionsPerSec * STEPS_PER_SCREW_REV_FULL_STEP;
   
+  // Ограничиваем скорость возможностями мотора
+  if (stepsPerSec > MAX_PARKING_STEPS_PER_SEC) {
+    stepsPerSec = MAX_PARKING_STEPS_PER_SEC;
+  }
+  
   if (stepsPerSec <= 0) return 0;
-  return (unsigned long)(1000000.0 / stepsPerSec);  // Интервал в микросекундах
+  
+  unsigned long intervalUs = (unsigned long)(1000000.0 / stepsPerSec);
+  
+  // Минимальный интервал для шагового мотора (обычно не менее 500-1000 мкс для надежности)
+  // 28BYJ-48 требует минимум ~1000 мкс (1 мс) между шагами для стабильной работы
+  if (intervalUs < 1000) {
+    intervalUs = 1000;  // Минимум 1000 мкс (1 мс) между шагами
+  }
+  
+  return intervalUs;
 }
 
 // ==================== ФУНКЦИИ УПРАВЛЕНИЯ ДВИГАТЕЛЕМ ====================
@@ -300,45 +328,66 @@ void enterWorkingMode() {
 
 void enterParkingMode() {
   currentState = STATE_PARKING;
-  setMicrostep(false);  // Выключаем микрошаг
-  setMotorDirection(false);  // Назад
+  // Сначала останавливаем таймер, если он работал
+  stopStepTimer();
+  // Устанавливаем направление назад (LOW)
+  setMotorDirection(false);
+  // Выключаем микрошаг (LOW) - это важно для максимальной скорости
+  setMicrostep(false);
+  // Небольшая задержка для установки сигналов
+  delayMicroseconds(100);
+  // Рассчитываем интервал для парковки
   stepIntervalUs = calculateParkingStepInterval();
-  startStepTimer();
+  // Запускаем таймер
+  if (stepIntervalUs > 0) {
+    startStepTimer();
+  }
   saveAngleToMemory();  // Сохраняем угол при смене режима
 }
 
 // ==================== ФУНКЦИИ ТАЙМЕРА ====================
 
 void setupStepTimer() {
-  stepTimer = timerBegin(0, 80, true);  // Таймер 0, делитель 80 (1MHz), счет вверх
+  // Создаем аппаратный таймер с частотой 1MHz (1 микросекунда на тик)
+  stepTimer = timerBegin(TIMER_FREQUENCY_HZ);
+  // Прикрепляем обработчик прерывания
   timerAttachInterrupt(stepTimer, &onStepTimer);
-  timerAlarmWrite(stepTimer, 0, false);  // Отключаем пока не нужно
-  timerAlarmEnable(stepTimer);
+  // Останавливаем таймер (запустим позже)
+  timerStop(stepTimer);
 }
 
 void startStepTimer() {
-  if (stepIntervalUs > 0) {
-    timerAlarmWrite(stepTimer, stepIntervalUs, true);  // Автоповтор
-    timerRestart(stepTimer);
+  if (stepIntervalUs > 0 && stepTimer != NULL) {
+    // Устанавливаем будильник: alarm_value в тиках таймера, autoreload=true, reload_count=0 (не используется)
+    timerAlarm(stepTimer, stepIntervalUs, true, 0);
+    // Запускаем таймер
+    timerStart(stepTimer);
   }
 }
 
 void stopStepTimer() {
-  timerAlarmWrite(stepTimer, 0, false);
-  timerStop(stepTimer);
+  if (stepTimer != NULL) {
+    timerStop(stepTimer);
+  }
 }
 
 void updateStepInterval() {
   // Пересчитываем интервал с учетом текущего угла и компенсации
   stepIntervalUs = calculateStepIntervalWithCompensation(currentAngleDeg, true);
-  if (currentState == STATE_WORKING) {
-    startStepTimer();
+  // Если таймер работает, перезапускаем с новым интервалом
+  if (currentState == STATE_WORKING && stepTimer != NULL) {
+    timerStop(stepTimer);
+    if (stepIntervalUs > 0) {
+      timerAlarm(stepTimer, stepIntervalUs, true, 0);
+      timerStart(stepTimer);
+    }
   }
 }
 
 // ==================== ФУНКЦИИ ОБРАБОТКИ ШАГОВ ====================
 
 void processStep() {
+  // Проверяем флаг от аппаратного таймера
   if (!stepTimerFlag) return;
   stepTimerFlag = false;
   
@@ -380,14 +429,15 @@ void processWorkingStep() {
 
 void processParkingStep() {
   // Проверяем концевой датчик
-  bool endstopState = digitalRead(PIN_ENDSTOP);
+  bool endstopRaw = digitalRead(PIN_ENDSTOP);
+  bool endstopState = ENDSTOP_INVERT ? !endstopRaw : endstopRaw;
   
-  // Проверяем, достигли ли концевого датчика (HIGH)
+  // Проверяем, достигли ли концевого датчика (показывает "припаркованы")
   if (endstopState) {
-    // Достигли концевого датчика - останавливаемся
-    stopStepTimer();
-    // Обновляем состояние для отслеживания перехода HIGH→LOW
+    // Достигли концевого датчика - переходим в паузу
+    // Обновляем состояние для отслеживания перехода
     lastEndstopState = true;
+    enterPauseMode();
     return;
   }
   
@@ -395,7 +445,7 @@ void processParkingStep() {
   bool previousEndstopState = lastEndstopState;
   lastEndstopState = endstopState;
   
-  // Проверяем переход HIGH→LOW (выход из концевого датчика)
+  // Проверяем переход из "припаркованы" в "не припаркованы" (выход из концевого датчика)
   if (previousEndstopState && !endstopState) {
     // Сброс угла на стартовый
     currentStepPosition = 0;
@@ -461,7 +511,7 @@ void saveAngleToMemory() {
   preferences.begin("tracker", false);
   preferences.putDouble("angle", currentAngleDeg);
   preferences.putLong("steps", currentStepPosition);
-  preferences.putBool("parked", isParked);
+  // isParked НЕ сохраняем - определяется только по концевому датчику
   preferences.end();
 }
 
@@ -469,31 +519,25 @@ void loadAngleFromMemory() {
   preferences.begin("tracker", false);
   
   if (preferences.isKey("angle") && preferences.isKey("steps")) {
+    // Загружаем сохраненные значения для компенсации тангенциальной ошибки
     double savedAngle = preferences.getDouble("angle", START_ANGLE_DEG);
     long savedSteps = preferences.getLong("steps", 0);
-    isParked = preferences.getBool("parked", false);
     
-    if (!isParked) {
-      // Используем сохраненный угол только если не припаркованы
-      currentAngleDeg = savedAngle;
-      currentStepPosition = savedSteps;
-      lastSavedStepPosition = savedSteps;
-      lastScrewRevolutionSteps = savedSteps;
-    } else {
-      // Если припаркованы, используем стартовый угол
-      currentAngleDeg = START_ANGLE_DEG;
-      currentStepPosition = 0;
-      lastSavedStepPosition = 0;
-      lastScrewRevolutionSteps = 0;
-    }
+    currentAngleDeg = savedAngle;
+    currentStepPosition = savedSteps;
+    lastSavedStepPosition = savedSteps;
+    lastScrewRevolutionSteps = savedSteps;
   } else {
     // Первый запуск - используем стартовый угол
     currentAngleDeg = START_ANGLE_DEG;
     currentStepPosition = 0;
-    isParked = true;
+    lastSavedStepPosition = 0;
+    lastScrewRevolutionSteps = 0;
   }
   
   preferences.end();
+  
+  // isParked НЕ загружается из памяти - определяется только по концевому датчику
 }
 
 // ==================== ФУНКЦИИ ИНДИКАЦИИ ====================
@@ -512,9 +556,12 @@ void updateLED() {
       break;
       
     case STATE_WORKING:
-      // Зеленый постоянный (можно сделать мигающим, если нужно)
-      M5.dis.drawpix(0, 0x00ff00);  // Зеленый
-      ledOnState = true;
+      // Зеленый мигающий (мигание не влияет на плавность, т.к. шаги генерируются аппаратным таймером)
+      if ((currentTime - lastLEDToggle) > LED_BLINK_INTERVAL_MS) {
+        lastLEDToggle = currentTime;
+        ledOnState = !ledOnState;
+        M5.dis.drawpix(0, ledOnState ? 0x00ff00 : 0x000000);  // Зеленый или выключен
+      }
       break;
       
     case STATE_PARKING:
@@ -537,9 +584,10 @@ void checkEndstop() {
     return;
   }
   
-  bool endstopState = digitalRead(PIN_ENDSTOP);
+  bool endstopRaw = digitalRead(PIN_ENDSTOP);
+  bool endstopState = ENDSTOP_INVERT ? !endstopRaw : endstopRaw;
   
-  // Проверяем переход HIGH→LOW (выход из концевого датчика)
+  // Проверяем переход из "припаркованы" в "не припаркованы" (выход из концевого датчика)
   if (lastEndstopState && !endstopState) {
     // Сброс угла на стартовый
     currentStepPosition = 0;
@@ -558,30 +606,66 @@ void setup() {
   M5.begin(true, false, true);  // Serial, I2C, Display
   delay(50);
   
+  // Инициализация Serial ПЕРВОЙ для отладки
+  Serial.begin(115200);
+  delay(100);  // Даем время Serial инициализироваться
+  
   // Настройка пинов
   setupMotorPins();
   setupButton();
   
   // Настройка концевого датчика
   pinMode(PIN_ENDSTOP, INPUT_PULLUP);
-  lastEndstopState = digitalRead(PIN_ENDSTOP);
+  delay(10);  // Небольшая задержка для стабилизации пина
   
-  // Загрузка угла из памяти
+  // Загрузка угла из памяти (для компенсации тангенциальной ошибки)
   loadAngleFromMemory();
   
-  // Проверяем концевой датчик при старте - если HIGH, значит мы в стартовом положении
-  if (lastEndstopState) {
-    // Мы в стартовом положении - сбрасываем угол
+  // Определяем состояние парковки ТОЛЬКО по концевому датчику
+  // Читаем несколько раз для надежности
+  bool endstopState1 = digitalRead(PIN_ENDSTOP);
+  delay(5);
+  bool endstopState2 = digitalRead(PIN_ENDSTOP);
+  delay(5);
+  bool endstopState3 = digitalRead(PIN_ENDSTOP);
+  // Используем значение, которое встречается минимум 2 раза из 3
+  bool endstopRaw = (endstopState1 && endstopState2) || (endstopState2 && endstopState3) || (endstopState1 && endstopState3);
+  // Инвертируем логику, если нужно
+  bool endstopState = ENDSTOP_INVERT ? !endstopRaw : endstopRaw;
+  
+  Serial.print("Endstop readings (raw): ");
+  Serial.print(endstopState1);
+  Serial.print(" ");
+  Serial.print(endstopState2);
+  Serial.print(" ");
+  Serial.print(endstopState3);
+  Serial.print(" -> raw: ");
+  Serial.print(endstopRaw);
+  Serial.print(", inverted: ");
+  Serial.println(endstopState);
+  
+  if (endstopState) {
+    // Концевик показывает "припаркованы" - мы в стартовом положении
+    // Сбрасываем позицию и угол на стартовые значения
     currentStepPosition = 0;
     currentAngleDeg = START_ANGLE_DEG;
     isParked = true;
+    Serial.println("Endstop -> PARKED (reset to 0)");
+    saveAngleToMemory();
+  } else {
+    // Концевик показывает "не припаркованы"
+    // Используем загруженные из памяти значения угла и позиции для компенсации тангенциальной ошибки
+    isParked = false;
+    Serial.println("Endstop -> NOT PARKED (using angle/position from memory for compensation)");
+    // Сохраняем текущее состояние
     saveAngleToMemory();
   }
+  lastEndstopState = endstopState;
   
   // Инициализация расчетов
   maxWorkingSteps = calculateStepsFromAngle(MAX_ANGLE_DEG, true);
   
-  // Настройка аппаратного таймера
+  // Настройка таймера шагов
   setupStepTimer();
   
   // Установка начального направления
@@ -593,7 +677,6 @@ void setup() {
   // Начальная индикация
   M5.dis.drawpix(0, 0xffff00);  // Желтый
   
-  Serial.begin(115200);
   Serial.println("Barndoor Star Tracker initialized");
   Serial.print("Current angle: ");
   Serial.print(currentAngleDeg);

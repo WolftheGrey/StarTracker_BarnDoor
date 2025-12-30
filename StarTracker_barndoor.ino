@@ -20,7 +20,7 @@
 
 // Параметры механики
 #define ARM_LENGTH_MM      200.0   // Длина плеча в мм
-#define SCREW_PITCH_MM     1.0     // Шаг резьбы М6 в мм
+#define SCREW_PITCH_MM     2.0     // Шаг резьбы в мм
 
 // Параметры двигателя
 #define MOTOR_STEPS_PER_REV    32          // Шагов на оборот двигателя (28BYJ-48)
@@ -272,8 +272,16 @@ void processButtonEvents() {
       if (pressDuration >= BUTTON_LONG_PRESS_MS && !buttonLongPressDetected) {
         buttonLongPressDetected = true;
         handleLongPress();
+        // Сбрасываем флаг, чтобы не обработать повторно после отпускания
+        buttonLongPressDetected = false;
       }
     }
+  }
+  
+  // Обработка длинного нажатия (после отпускания кнопки, если не было обработано ранее)
+  if (buttonLongPressDetected) {
+    buttonLongPressDetected = false;
+    handleLongPress();
   }
   
   // Обработка короткого нажатия
@@ -547,12 +555,8 @@ void updateLED() {
   
   switch (currentState) {
     case STATE_PAUSE:
-      // Мигающий желтый
-      if ((currentTime - lastLEDToggle) > LED_BLINK_INTERVAL_MS) {
-        lastLEDToggle = currentTime;
-        ledOnState = !ledOnState;
-        M5.dis.drawpix(0, ledOnState ? 0xffff00 : 0x000000);  // Желтый или выключен
-      }
+      // Постоянно светящийся желтый
+      M5.dis.drawpix(0, 0xffff00);  // Желтый постоянно включен
       break;
       
     case STATE_WORKING:
